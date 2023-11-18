@@ -37,6 +37,16 @@ module.exports = {
         },
       },
       {
+        test: /\.ts$/,
+        exclude: /node_modules/,
+        use: {
+          loader: 'babel-loader',
+          options: {
+            presets: ['@babel/preset-env', '@babel/preset-typescript'],
+          },
+        },
+      },
+      {
         test: /\.(le|c)ss$/,
         use: ['style-loader', 'css-loader', 'less-loader'],
       },
