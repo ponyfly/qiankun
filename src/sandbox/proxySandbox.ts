@@ -1,14 +1,14 @@
 /* eslint-disable no-param-reassign */
-import { without } from 'lodash';
 /**
  * @author Kuitos
  * @since 2020-3-31
  */
+import { without } from 'lodash';
 import type { SandBox } from '../interfaces';
 import { SandBoxType } from '../interfaces';
 import { isPropertyFrozen, nativeGlobal, nextTask } from '../utils';
-import { clearCurrentRunningApp, getCurrentRunningApp, getTargetValue, setCurrentRunningApp } from './common';
-import { globals } from './globals';
+import { clearCurrentRunningApp, getCurrentRunningApp, rebindTarget2Fn, setCurrentRunningApp } from './common';
+import { globalsInBrowser, globalsInES2015 } from './globals';
 
 type SymbolTarget = 'target' | 'globalContext';
 
@@ -22,6 +22,31 @@ function uniq(array: Array<string | symbol>) {
   return array.filter(function filter(this: PropertyKey[], element) {
     return element in this ? false : ((this as any)[element] = true);
   }, Object.create(null));
+}
+
+/**
+ * transform array to object to enable faster element check with in operator
+ * @param array
+ */
+function array2TruthyObject(array: string[]): Record<string, true> {
+  return array.reduce(
+    (acc, key) => {
+      acc[key] = true;
+      return acc;
+    },
+    // Notes that babel will transpile spread operator to Object.assign({}, ...args), which will keep the prototype of Object in merged object,
+    // while this result used as Symbol.unscopables, it will make properties in Object.prototype always be escaped from proxy sandbox as unscopables check will look up prototype chain as well,
+    // such as hasOwnProperty, toString, valueOf, etc.
+    // so we should use Object.create(null) to create a pure object without prototype chain here.
+    Object.create(null),
+  );
+}
+
+const cachedGlobalsInBrowser = array2TruthyObject(
+  globalsInBrowser.concat(process.env.NODE_ENV === 'test' ? ['mockNativeWindowFunction'] : []),
+);
+function isNativeGlobalProp(prop: string): boolean {
+  return prop in cachedGlobalsInBrowser;
 }
 
 // zone.js will overwrite Object.defineProperty
@@ -58,25 +83,19 @@ const mockGlobalThis = 'mockGlobalThis';
 const accessingSpiedGlobals = ['document', 'top', 'parent', 'eval'];
 const overwrittenGlobals = ['window', 'self', 'globalThis', 'hasOwnProperty'].concat(inTest ? [mockGlobalThis] : []);
 export const cachedGlobals = Array.from(
-  new Set(without(globals.concat(overwrittenGlobals).concat('requestAnimationFrame'), ...accessingSpiedGlobals)),
+  new Set(
+    without(globalsInES2015.concat(overwrittenGlobals).concat('requestAnimationFrame'), ...accessingSpiedGlobals),
+  ),
 );
 
-// transform cachedGlobals to object for faster element check
-const cachedGlobalObjects = cachedGlobals.reduce((acc, globalProp) => ({ ...acc, [globalProp]: true }), {});
+const cachedGlobalObjects = array2TruthyObject(cachedGlobals);
 
 /*
  Variables who are impossible to be overwritten need to be escaped from proxy sandbox for performance reasons.
  But overwritten globals must not be escaped, otherwise they will be leaked to the global scope.
  see https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Symbol/unscopables
  */
-const unscopables = without(cachedGlobals, ...accessingSpiedGlobals.concat(overwrittenGlobals)).reduce(
-  (acc, key) => ({ ...acc, [key]: true }),
-  // Notes that babel will transpile spread operator to Object.assign({}, ...args), which will keep the prototype of Object in merged object,
-  // while this result used as Symbol.unscopables, it will make properties in Object.prototype always be escaped from proxy sandbox as unscopables check will look up prototype chain as well,
-  // such as hasOwnProperty, toString, valueOf, etc.
-  // so we should use Object.create(null) to create a pure object without prototype chain here.
-  Object.create(null),
-);
+const unscopables = array2TruthyObject(without(cachedGlobals, ...accessingSpiedGlobals.concat(overwrittenGlobals)));
 
 const useNativeWindowForBindingsProps = new Map<PropertyKey, boolean>([
   ['fetch', true],
@@ -84,7 +103,7 @@ const useNativeWindowForBindingsProps = new Map<PropertyKey, boolean>([
 ]);
 
 function createFakeWindow(globalContext: Window, speedy: boolean) {
-  // map always has the fastest performance in has check scenario
+  // map always has the fastest performance in has checked scenario
   // see https://jsperf.com/array-indexof-vs-set-has/23
   const propertiesWithGetter = new Map<PropertyKey, boolean>();
   const fakeWindow = {} as FakeWindow;
@@ -297,14 +316,20 @@ export default class ProxySandbox implements SandBox {
           return value;
         }
 
+        // non-native property return directly to avoid rebind
+        if (!isNativeGlobalProp(p as string) && !useNativeWindowForBindingsProps.has(p)) {
+          return value;
+        }
+
         /* Some dom api must be bound to native window, otherwise it would cause exception like 'TypeError: Failed to execute 'fetch' on 'Window': Illegal invocation'
            See this code:
              const proxy = new Proxy(window, {});
+             // in nest sandbox fetch will be bind to proxy rather than window in master
              const proxyFetch = fetch.bind(proxy);
              proxyFetch('https://qiankun.com');
         */
         const boundTarget = useNativeWindowForBindingsProps.get(p) ? nativeGlobal : globalContext;
-        return getTargetValue(boundTarget, value);
+        return rebindTarget2Fn(boundTarget, value);
       },
 
       // trap in operator
